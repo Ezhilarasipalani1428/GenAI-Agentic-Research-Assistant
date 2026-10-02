@@ -3,33 +3,32 @@ agent.py - Core module for the Agentic AI Research & Report Generation System.
 
 Purpose
 -------
-This module is the entry point for talking to the Gemini model. In this first
-version it does only three things:
+This module is the central entry point of the agent. It provides:
 
-1. Loads the GEMINI_API_KEY from the project's root `.env` file.
-2. Creates (and reuses) a single Gemini client.
-3. Exposes `run_agent(task)`, which sends a task to Gemini and returns the
-   response text.
+1. `get_client()`            - a reusable Groq client (API key from root `.env`).
+2. `run_agent(task)`         - send a single task to the model and return the text.
+3. `run_research_workflow()` - orchestrates the multi-step research workflow:
+       plan -> extract tasks -> research each task -> combine -> final report.
 
-Later versions will grow this into a full research agent that plans, researches,
-analyses, and writes reports. For now there are no tools, no web search, and no
-planning loops - just a clean foundation to build on.
+The individual workflow steps live in their own modules:
+    - src/planner.py          -> create_research_plan()
+    - src/researcher.py       -> research_task()
+    - src/report_generator.py -> generate_report()
 
 Usage
 -----
-    from src.agent import run_agent
+    from src.agent import run_research_workflow
 
-    answer = run_agent("Explain what a research agent is.")
-    print(answer)
+    report = run_research_workflow("Impact of AI on healthcare")
+    print(report)
 """
 
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+from groq import Groq, GroqError
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -40,15 +39,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 
 # Load variables from the root `.env` file into the process environment.
-# If the file doesn't exist, this silently does nothing and we'll fall back to
-# any variables already set in the environment.
 load_dotenv(dotenv_path=ENV_PATH)
 
-# Name of the Gemini model to use. Kept as a constant so it's easy to change.
-MODEL_NAME = "gemini-3.5-flash-lite"
+# Groq model to use. Override it by setting GROQ_MODEL in the `.env` file.
+# Note: "llama-3.3-70b-versatile" was shut down by Groq on 16 Aug 2026, so the
+# default is the production model "openai/gpt-oss-120b" (available on the free
+# tier). Check https://console.groq.com/docs/models for the current list.
+MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
-# Tells the model what role it plays. We'll expand this as the agent gains
-# new abilities (planning, research, analysis, report generation).
+# Tells the model what role it plays.
 SYSTEM_INSTRUCTION = (
     "You are an AI research agent. Your purpose is to help users investigate "
     "topics and produce well-structured reports. In future versions you will "
@@ -57,153 +56,173 @@ SYSTEM_INSTRUCTION = (
 )
 
 # Holds the shared client so we only create it once (see `get_client`).
-_client: genai.Client | None = None
+_client: Groq | None = None
 
 
 # ---------------------------------------------------------------------------
 # Client setup
 # ---------------------------------------------------------------------------
 
-def get_client() -> genai.Client:
-    """Return a reusable Gemini client, creating it on first use.
+def get_client() -> Groq:
+    """Return a reusable Groq client, creating it on first use.
 
-    The API key is read from the `GEMINI_API_KEY` environment variable
+    The API key is read from the `GROQ_API_KEY` environment variable
     (populated from the root `.env` file). The key is never printed or logged.
+    The Groq SDK applies a 60-second request timeout by default, so requests
+    cannot hang indefinitely.
 
     Raises:
-        EnvironmentError: If `GEMINI_API_KEY` is missing or empty.
+        EnvironmentError: If `GROQ_API_KEY` is missing or empty.
     """
     global _client
 
     if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("GROQ_API_KEY")
 
         if not api_key or not api_key.strip():
             raise EnvironmentError(
-                "GEMINI_API_KEY is not set. Add a line like "
-                "GEMINI_API_KEY=your_key_here to the .env file in the project "
+                "GROQ_API_KEY is not set. Add a line like "
+                "GROQ_API_KEY=your_key_here to the .env file in the project "
                 f"root ({ENV_PATH}) and try again."
             )
 
-        _client = genai.Client(api_key=api_key.strip())
+        _client = Groq(api_key=api_key.strip())
 
     return _client
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Internal helpers
 # ---------------------------------------------------------------------------
 
-def run_agent(task: str) -> str:
-    """Send a task to Gemini and return its response text.
+def _validate_text(value: str, name: str) -> str:
+    """Check that `value` is a non-empty string and return it stripped."""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string.")
+    if not value.strip():
+        raise ValueError(f"{name} must be a non-empty string.")
+    return value.strip()
 
-    Args:
-        task: The user's research request, as a non-empty string.
 
-    Returns:
-        The text generated by Gemini.
+def _generate(prompt: str) -> str:
+    """Send `prompt` to Groq and return the generated text.
 
     Raises:
-        ValueError: If `task` is not a string or is empty/whitespace only.
-        EnvironmentError: If `GEMINI_API_KEY` is not configured.
-        RuntimeError: If the Gemini API call fails or returns no text.
+        EnvironmentError: If the API key is missing.
+        RuntimeError: If the API call fails or returns no text.
     """
-    # 1. Validate the input.
-    if not isinstance(task, str):
-        raise ValueError("task must be a string.")
-    if not task.strip():
-        raise ValueError("task must be a non-empty string.")
-
-    # 2. Get the shared client (raises a clear error if the key is missing).
     client = get_client()
 
-    # 3. Call Gemini, converting API failures into a simple RuntimeError.
     try:
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
-            contents=task.strip(),
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-            ),
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": prompt},
+            ],
         )
-    except genai_errors.APIError as exc:
-        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
-    except Exception as exc:  # e.g. network problems
+    except GroqError as exc:
+        raise RuntimeError(f"Groq API request failed: {exc}") from exc
+    except Exception as exc:  # e.g. network problems or timeouts
         raise RuntimeError(
-            f"Unexpected error while calling Gemini: {exc}"
+            f"Unexpected error while calling Groq: {exc}"
         ) from exc
 
-    # 4. Make sure we actually got text back (it can be empty if blocked).
-    if not response.text:
+    # The generated text lives in the first choice's message.
+    text = response.choices[0].message.content if response.choices else None
+
+    if not text or not text.strip():
         raise RuntimeError(
-            "Gemini returned an empty response. The request may have been "
+            "Groq returned an empty response. The request may have been "
             "blocked or produced no text."
         )
 
-    return response.text
-    def run_research_workflow(topic: str) -> str:
+    return text
+
+
+def extract_research_tasks(plan: str) -> list[str]:
+    """Extract the numbered tasks (e.g. '1. ...' or '2) ...') from a plan.
+
+    Raises:
+        RuntimeError: If no numbered tasks are found in the plan.
     """
-    Run the complete research workflow.
-
-    Flow:
-    1. Create a research plan.
-    2. Research the planned tasks.
-    3. Combine the research.
-    4. Generate the final report.
-    """
-
-    if not isinstance(topic, str):
-        raise ValueError("topic must be a string.")
-
-    if not topic.strip():
-        raise ValueError("topic must be a non-empty string.")
-
-    from src.planner import create_research_plan
-    from src.researcher import research_task
-    from src.report_generator import generate_report
-
-    clean_topic = topic.strip()
-
-    # Step 1: Create the research plan
-    plan = create_research_plan(clean_topic)
-
-    # Step 2: Extract research tasks from the plan
     tasks = []
-
     for line in plan.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        # Skip headings and descriptive lines
-        if line[0].isdigit() and "." in line:
-            task = line.split(".", 1)[1].strip()
-
-            if task:
-                tasks.append(task)
+        match = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+        if match:
+            tasks.append(match.group(1).strip())
 
     if not tasks:
-        tasks = [plan]
-
-    # Step 3: Research each task
-    research_results = []
-
-    for index, task in enumerate(tasks, start=1):
-        research = research_task(task)
-
-        research_results.append(
-            f"Research Task {index}:\n"
-            f"{task}\n\n"
-            f"{research}"
+        raise RuntimeError(
+            "Could not find any numbered research tasks in the generated plan."
         )
 
-    combined_research = "\n\n".join(research_results)
+    return tasks
 
-    # Step 4: Generate the final report
-    report = generate_report(
-        clean_topic,
-        combined_research
-    )
 
-    return report
+# ---------------------------------------------------------------------------
+# Single-task agent
+# ---------------------------------------------------------------------------
+
+def run_agent(task: str) -> str:
+    """Send a task to the model and return its response text.
+
+    Args:
+        task: The user's request, as a non-empty string.
+
+    Returns:
+        The text generated by the model.
+
+    Raises:
+        ValueError: If `task` is not a string or is empty/whitespace only.
+        EnvironmentError: If `GROQ_API_KEY` is not configured.
+        RuntimeError: If the Groq API call fails or returns no text.
+    """
+    task = _validate_text(task, "task")
+    return _generate(task)
+
+
+# ---------------------------------------------------------------------------
+# Full workflow
+# ---------------------------------------------------------------------------
+
+def run_research_workflow(topic: str) -> str:
+    """Run the full research workflow for `topic` and return the final report.
+
+    Steps:
+        1. Create a research plan          (src.planner)
+        2. Extract the numbered tasks      (extract_research_tasks, above)
+        3. Research each task              (src.researcher)
+        4. Combine the results
+        5. Generate the final report       (src.report_generator)
+
+    Raises:
+        ValueError: If `topic` is not a non-empty string.
+        EnvironmentError: If `GROQ_API_KEY` is not configured.
+        RuntimeError: If any Groq call fails or no tasks can be extracted.
+    """
+    # These modules may themselves import `get_client` from this file, so we
+    # import them here (inside the function) to avoid a circular import.
+    from src.planner import create_research_plan
+    from src.report_generator import generate_report
+    from src.researcher import research_task
+
+    topic = _validate_text(topic, "topic")
+
+    # 1. Plan
+    plan = create_research_plan(topic)
+
+    # 2. Extract tasks
+    tasks = extract_research_tasks(plan)
+
+    # 3. Research each task
+    sections = []
+    for number, task in enumerate(tasks, start=1):
+        findings = research_task(task)
+        sections.append(f"Task {number}: {task}\n{findings}")
+
+    # 4. Combine
+    combined_results = "\n\n".join(sections)
+
+    # 5. Final report
+    return generate_report(topic, combined_results)
